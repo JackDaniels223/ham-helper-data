@@ -45,6 +45,7 @@ jobs:
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           gh release view current --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create current --repo "$GITHUB_REPOSITORY" --title "Callsign data (rolling)" --notes "FCC ULS public amateur data, active licenses only. See README."
+          [ -f out/chain.json ] || echo "[]" > out/chain.json
           gh release upload current out/*.hhc.gz out/chain.json --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload current out/manifest.json --clobber --repo "$GITHUB_REPOSITORY"
           # delete assets no longer referenced by the manifest

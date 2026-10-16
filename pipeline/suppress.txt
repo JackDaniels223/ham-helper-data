@@ -1,1 +1,3 @@
-# One callsign per line. Removed from every full file and delta (see docs/PRIVACY.md). Lines starting with # are ignored.
+# Removal requests (docs/PRIVACY.md). One entry per line: sha256hex("hamhelper/suppress/v1:" + CALLSIGN), NEVER the callsign itself.
+# Generate: node --no-warnings --experimental-transform-types --import ./data-pipeline/ts-resolve.mjs data-pipeline/build.mts suppress-hash <CALL>
+# Mirror every entry in src/uls/suppress.ts (SUPPRESSED_HASHES). Lines starting with # are ignored.

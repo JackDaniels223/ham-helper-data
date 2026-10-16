@@ -1,58 +1,72 @@
-# Builds the Ham Helper callsign data from FCC ULS public files. Uses only the built-in GITHUB_TOKEN.
-# Schedule: daily delta; full rebuild + reconcile delta on Sundays (when the FCC posts the weekly l_amat.zip).
+# Builds the Ham Helper callsign data from FCC ULS public files and publishes it to the rolling release "current".
+# Schedule: daily delta from l_am_<day>.zip; Sundays a full rebuild from the weekly l_amat.zip + a reconcile delta.
+# Safety (QA N-H1): every source file's HTTP Last-Modified must be newer than the last one processed (sources.json),
+# otherwise the build exits 75 and nothing is published; the daily merge never applies an older license over a newer one;
+# a full build whose active count moves > 2% is refused. The manifest is Ed25519-signed (secret MANIFEST_SIGNING_KEY,
+# used only in the signing step). Other auth: the built-in GITHUB_TOKEN only.
 name: uls-data
 on:
   schedule:
-    - cron: '30 13 * * *'   # daily 13:30 UTC (the FCC posts daily files ~08:00 ET; the weekly full file appears Sunday)
-  workflow_dispatch: {}
+    - cron: '30 15 * * *'   # daily 15:30 UTC (FCC posts dailies ~08:00 UTC; the weekly l_amat.zip ~13:20 UTC Sunday)
+  workflow_dispatch:
+    inputs:
+      mode: { description: 'auto | full | daily', default: 'auto', type: choice, options: [auto, full, daily] }
+      force: { description: 'Re-process a source file with the SAME Last-Modified (never an older one)', default: false, type: boolean }
 permissions:
-  contents: write            # needed to upload release assets and push the keep-alive state commit
+  contents: write
 concurrency: { group: uls-data, cancel-in-progress: false }
 jobs:
   build:
-    runs-on: ubuntu-latest   # standard runner: free for public repos (no larger runners: those are always billed)
+    runs-on: ubuntu-24.04    # pinned (ubuntu-latest moves to 26.04 from 2026-10-19)
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { path: data }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '22' }
       - name: Restore previous state from the rolling release
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           mkdir -p out && cd out
-          gh release download current --repo "$GITHUB_REPOSITORY" --pattern 'state.hhc.gz' --pattern 'chain.json' --pattern 'manifest.json' --pattern '*.hhc.gz' || echo "first run"
-      - name: Build
+          gh release download current --repo "$GITHUB_REPOSITORY" --pattern 'state.hhc.gz' --pattern 'chain.json' --pattern 'sources.json' --pattern '*.hhc.gz' || echo "first run"
+      - name: Build (fails closed on stale sources)
+        env: { MODE: '${{ inputs.mode }}', FORCE: '${{ inputs.force }}' }
         run: |
-          set -euo pipefail
-          DATE=$(date -u +%Y%m%d); DOW=$(date -u +%a | tr A-Z a-z)
-          P="node --no-warnings --import ./data/pipeline/ts-resolve.mjs data/pipeline/build.mts"
-          if [ -f out/manifest.json ] && [ "$(node -e "const m=require('./out/manifest.json');console.log(m.deltas.length?m.deltas.at(-1).to:m.full.built)")" = "$DATE" ]; then echo "already built $DATE"; echo SKIP=1 >> "$GITHUB_ENV"; exit 0; fi
-          if [ "$(date -u +%u)" = "7" ] || [ ! -f out/state.hhc.gz ]; then
-            curl -fsSL --retry 3 -o l_amat.zip https://data.fcc.gov/download/pub/uls/complete/l_amat.zip
-            unzip -q -o l_amat.zip -d uls
-            $P full uls out "$DATE"
+          set -uo pipefail
+          DATE=$(date -u +%Y%m%d); DOW=$(date -u -d yesterday +%a | tr A-Z a-z)  # l_am_<day> holds <day>'s transactions and is posted the next morning (~08:00 UTC)
+          P="node --no-warnings --experimental-transform-types --import ./data/pipeline/ts-resolve.mjs data/pipeline/build.mts"
+          F=""; [ "${FORCE:-false}" = "true" ] && F="--force"
+          lm() { curl -fsSIL --retry 3 "$1" | tr -d '\r' | awk 'tolower($1)=="last-modified:"{sub(/^[^:]*: */,""); v=$0} END{print v}'; }
+          M="${MODE:-auto}"; if [ "$M" = "auto" ]; then if [ "$(date -u +%u)" = "7" ] || [ ! -f out/state.hhc.gz ]; then M=full; else M=daily; fi; fi
+          if [ "$M" = "full" ]; then
+            U=https://data.fcc.gov/download/pub/uls/complete/l_amat.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
+            curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d uls || exit 1
+            $P full uls out "$DATE" --last-modified "$LM" $F; rc=$?
           else
-            curl -fsSL --retry 3 -o daily.zip "https://data.fcc.gov/download/pub/uls/daily/l_am_${DOW}.zip"
-            unzip -q -o daily.zip -d daily
-            $P daily out/state.hhc.gz daily out "$DATE"
+            U=https://data.fcc.gov/download/pub/uls/daily/l_am_${DOW}.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
+            curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d daily || exit 1
+            $P daily out/state.hhc.gz daily out "$DATE" --last-modified "$LM" $F; rc=$?
           fi
-          # prune files older than the rolling window (manifest only lists 35 days of deltas + the latest full)
-          find out -name 'delta-*.hhc.gz' -mtime +40 -delete; ls -t out/full-*.hhc.gz | tail -n +2 | xargs -r rm
-          $P manifest out
-      - name: Publish to the rolling release "current" (new dated files first, manifest last)
+          if [ $rc -eq 75 ]; then echo "::notice::stale source, nothing published"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; fi
+          exit $rc
+      - name: Sign manifest
+        if: env.SKIP != '1'
+        env: { MANIFEST_SIGNING_KEY: '${{ secrets.MANIFEST_SIGNING_KEY }}' }
+        run: node --no-warnings --experimental-transform-types --import ./data/pipeline/ts-resolve.mjs data/pipeline/build.mts manifest out
+      - name: Publish to the rolling release "current" (dated files first, manifest last)
         if: env.SKIP != '1'
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
-          gh release view current --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create current --repo "$GITHUB_REPOSITORY" --title "Callsign data (rolling)" --notes "FCC ULS public amateur data, active licenses only. See README."
+          set -euo pipefail
           [ -f out/chain.json ] || echo "[]" > out/chain.json
-          gh release upload current out/*.hhc.gz out/chain.json --clobber --repo "$GITHUB_REPOSITORY"
+          gh release view current --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create current --repo "$GITHUB_REPOSITORY" --title "Callsign data (rolling)" --notes "FCC ULS public amateur data, active licenses only. See README."
+          gh release upload current out/*.hhc.gz out/chain.json out/sources.json --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload current out/manifest.json --clobber --repo "$GITHUB_REPOSITORY"
-          # delete assets no longer referenced by the manifest
-          node -e "const m=require('./out/manifest.json');const keep=new Set(['manifest.json','state.hhc.gz','chain.json',m.full.url,...m.deltas.map(d=>d.url)]);console.log([...keep].join('\n'))" > keep.txt
-          gh release view current --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -vxFf keep.txt | xargs -r -I{} gh release delete-asset current {} -y --repo "$GITHUB_REPOSITORY"
+          node -e "const e=require('./out/manifest.json');const m=JSON.parse(e.payload);console.log(['manifest.json','state.hhc.gz','chain.json','sources.json',m.full.url,...m.deltas.map(d=>d.url)].join('\n'))" > keep.txt
+          gh release view current --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | { grep -vxFf keep.txt || true; } | xargs -r -I{} gh release delete-asset current {} -y --repo "$GITHUB_REPOSITORY"
       - name: Keep-alive commit (scheduled workflows auto-disable after 60 days without repo activity)
+        if: env.SKIP != '1'
         run: |
-          cd data && cp ../out/manifest.json last-manifest.json
+          cd data && cp ../out/manifest.json last-manifest.json && cp ../out/sources.json last-sources.json
           git config user.name "uls-bot"; git config user.email "uls-bot@users.noreply.github.com"
-          git add last-manifest.json && git commit -m "data $(date -u +%F)" && git push || echo "no change"
+          git add last-manifest.json last-sources.json && git commit -m "data $(date -u +%F)" && git push || echo "no change"

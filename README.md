@@ -8,7 +8,7 @@ Callsign lookup data for the **Ham Helper** app. It's built automatically from t
   - Licenses past the FCC's 2-year renewal grace period are excluded, measured from the FCC file's date (so a license can appear for up to about a week after its grace period ends, until the next weekly rebuild).
 - **Where it lives:** release [`current`](../../releases/tag/current), with `manifest.json`, `full-YYYYMMDDHHMM.hhc.gz` and `delta-YYYYMMDDHHMM.hhc.gz`. The build's working state is private: it is kept only in an encrypted Actions cache and is never published. Each file is listed in the manifest with its byte size and sha256.
 - **Schedule** (`.github/workflows/uls.yml`):
-  - Daily at 15:30 UTC: a delta built from yesterday's FCC daily file (`l_am_<day>.zip` is posted the morning after).
+  - Daily at 15:30 UTC: one delta per FCC daily file (`l_am_<day>.zip`, posted the morning after) newer than the last one applied, oldest first; the FCC keeps 7.
   - Sundays: a full rebuild from the FCC weekly file, plus a reconcile delta, so clients keep updating via deltas (a 35-day rolling chain).
 - **Integrity:** `manifest.json` is an Ed25519-signed envelope (`payload` + `sig`, key id `hh1`). Public key (base64, raw 32 bytes): `0aw435wpAZwjIFP3R7AIC39U+npzpQqynygHHK7FBuc=`. Each file is listed in the payload with its size and sha256. Version stamps are the FCC file's Last-Modified time (UTC, YYYYMMDDHHMM).
 - **Freshness:** a source file is only processed if its HTTP `Last-Modified` is newer than every source already processed (`sources.json`). Otherwise the run publishes nothing. Older license records never overwrite newer ones.

@@ -1,5 +1,5 @@
 # Builds the Ham Helper callsign data from FCC ULS public files and publishes it to the rolling release "current".
-# Schedule: daily delta from l_am_<day>.zip; Sundays a full rebuild from the weekly l_amat.zip + a reconcile delta.
+# Schedule: daily, every retained FCC daily newer than the last one applied (in order); Sundays a full rebuild from the weekly l_amat.zip + a reconcile delta.
 # Safety (QA N-H1): every source file's HTTP Last-Modified must be newer than the last one processed (sources.json),
 # otherwise the build exits 75 and nothing is published; the daily merge never applies an older license over a newer one;
 # a full build whose active count moves > 2% is refused. The manifest is Ed25519-signed (secret MANIFEST_SIGNING_KEY,
@@ -7,7 +7,7 @@
 # committed or published). Version stamps = the FCC file's Last-Modified (UTC YYYYMMDDHHMM). A privacy guard fails the
 # build if any address-like value survives city sanitising. Actions are pinned by commit SHA. Other auth: GITHUB_TOKEN only.
 # PRIVATE state (QA b4cbdf1 M3): out/private/{state.hhc.gz,purge.json} is NEVER published. Between runs it lives only in the
-# Actions cache, AES-256-GCM sealed (data/pipeline/private-box.mjs, key derived from MANIFEST_SIGNING_KEY) because fork-PR
+# Actions cache, AES-256-GCM sealed (data/pipeline/private-box.mjs, secret PRIVATE_STATE_KEY: 32 random bytes, base64) because fork-PR
 # workflows can restore a public repo's caches but never get secrets. Cache miss → a full build (the delta chain resets).
 # The public sources.json holds only source Last-Modified stamps; purge state is never logged.
 name: uls-data
@@ -34,40 +34,46 @@ jobs:
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with: { path: box, key: 'uls-private-${{ github.run_id }}-${{ github.run_attempt }}', restore-keys: 'uls-private-' }
       - name: Open private state; restore public files from the rolling release
-        env: { GH_TOKEN: '${{ github.token }}', PRIVATE_BOX_SECRET: '${{ secrets.MANIFEST_SIGNING_KEY }}' }
+        env: { GH_TOKEN: '${{ github.token }}', PRIVATE_STATE_KEY: '${{ secrets.PRIVATE_STATE_KEY }}' }
         run: |
           set -euo pipefail
-          mkdir -p out/private && node data/pipeline/private-box.mjs open box out/private
+          mkdir -p out/private
+          # A box that won't open with PRIVATE_STATE_KEY (e.g. sealed under the old derived key, or tampered) is discarded:
+          # no state → the build below does a forced full rebuild from the weekly file plus every newer daily.
+          if ! node data/pipeline/private-box.mjs open box out/private; then echo "::warning::private state could not be opened; full rebuild"; rm -rf out/private; mkdir -p out/private; fi
           cd out
           gh release download current --repo "$GITHUB_REPOSITORY" --pattern 'chain.json' --pattern 'sources.json' --pattern 'full-*.hhc.gz' --pattern 'delta-*.hhc.gz' || echo "first run"
-          # one-time migration from the old layout: the public state file seeds the private state, then is deleted below
-          if [ ! -f private/state.hhc.gz ] && gh release download current --repo "$GITHUB_REPOSITORY" --pattern 'state.hhc.gz' -D legacy 2>/dev/null; then mv legacy/state.hhc.gz private/state.hhc.gz; echo "migrated legacy state"; fi
-          rm -rf legacy
-          # the public sources.json never carries purge state (older builds wrote purgePending)
-          [ -f sources.json ] && node -e "const f='sources.json',j=require('./'+f);delete j.purgePending;require('fs').writeFileSync(f,JSON.stringify(j,null,1))" || true
       - name: Build (fails closed on stale sources)
         env: { MODE: '${{ inputs.mode }}', FORCE: '${{ inputs.force }}', SUPPRESS_LIST: '${{ secrets.SUPPRESS_LIST }}' }
         run: |
           set -uo pipefail
-          DOW=$(date -u -d yesterday +%a | tr A-Z a-z)  # l_am_<day> holds <day>'s transactions and is posted the next morning (~08:00 UTC)
           P="node --no-warnings --experimental-transform-types --import ./data/pipeline/ts-resolve.mjs data/pipeline/build.mts"
           F=""; [ "${FORCE:-false}" = "true" ] && F="--force"
           lm() { curl -fsSIL --retry 3 "$1" | tr -d '\r' | awk 'tolower($1)=="last-modified:"{sub(/^[^:]*: */,""); v=$0} END{print v}'; }
           M="${MODE:-auto}"; if [ "$M" = "auto" ]; then if [ "$(date -u +%u)" = "7" ] || [ ! -f out/private/state.hhc.gz ]; then M=full; else M=daily; fi; fi
+          [ ! -f out/private/state.hhc.gz ] && { M=full; F="--force"; echo "no private state: forced full rebuild"; }
+          published=0
           if [ "$M" = "full" ]; then
             U=https://data.fcc.gov/download/pub/uls/complete/l_amat.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
             curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d uls || exit 1
             $P full uls out --last-modified "$LM" $F && rc=0 || rc=$?
-          else
-            U=https://data.fcc.gov/download/pub/uls/daily/l_am_${DOW}.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
-            curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d daily || exit 1
-            $P daily out/private/state.hhc.gz daily out --last-modified "$LM" $F && rc=0 || rc=$?
+            if [ $rc -eq 0 ]; then published=1; elif [ $rc -ne 75 ]; then exit $rc; fi
           fi
-          if [ $rc -eq 75 ]; then echo "::notice::stale source, nothing published"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; fi
-          exit $rc
+          # Apply EVERY retained FCC daily (the FCC keeps 7) newer than the last one processed, oldest first, ordered by
+          # Last-Modified. build.mts refuses (exit 75) any daily not newer than the watermark, so this is idempotent.
+          [ -f out/private/state.hhc.gz ] || { echo "no state and no full build"; exit 1; }
+          for d in mon tue wed thu fri sat sun; do U=https://data.fcc.gov/download/pub/uls/daily/l_am_$d.zip; L=$(lm $U); [ -n "$L" ] && printf '%s\t%s\t%s\n' "$(date -u -d "$L" +%s)" "$d" "$L"; done | sort -n > dailies.tsv
+          while IFS=$'\t' read -r ts d L; do
+            rm -rf daily && curl -fsSL --retry 3 -o d.zip https://data.fcc.gov/download/pub/uls/daily/l_am_$d.zip && unzip -q -o d.zip -d daily || exit 1
+            echo "daily l_am_$d Last-Modified: $L"
+            $P daily out/private/state.hhc.gz daily out --last-modified "$L" && rc=0 || rc=$?
+            if [ $rc -eq 0 ]; then published=1; elif [ $rc -ne 75 ]; then exit $rc; fi
+          done < dailies.tsv
+          if [ $published -eq 0 ]; then echo "::notice::no newer source, nothing published"; echo "SKIP=1" >> "$GITHUB_ENV"; fi
+          exit 0
       - name: Seal private state
         if: hashFiles('out/private/state.hhc.gz') != ''
-        env: { PRIVATE_BOX_SECRET: '${{ secrets.MANIFEST_SIGNING_KEY }}' }
+        env: { PRIVATE_STATE_KEY: '${{ secrets.PRIVATE_STATE_KEY }}' }
         run: rm -rf box && node data/pipeline/private-box.mjs seal out/private box
       - name: Save sealed private state to the Actions cache
         if: hashFiles('box/state.hhc.gz.box') != ''

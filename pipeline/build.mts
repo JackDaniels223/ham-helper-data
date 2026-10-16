@@ -44,7 +44,11 @@ const fail = (code: number, msg: string): never => { console.error(msg); process
 function freshOrExit(out: string, kind: 'full' | 'daily') {
   const p = join(out, 'sources.json'); const prev = readJson<Sources>(p, {}); const f = checkFresh(prev, kind, lastModified, force);
   if (!f.ok) fail(75, `SKIP: ${f.reason}`);
-  return () => writeFileSync(p, JSON.stringify({ ...prev, [kind]: new Date(Date.parse(lastModified!)).toISOString() }, null, 1));
+  const iso = new Date(Date.parse(lastModified!)).toISOString();
+  // A full build REPLACES the state, so the daily watermark resets to the full's date: every FCC daily posted after the weekly
+  // file then applies again, in order (the workflow loops over all 7 retained dailies). Without this, a forced full rebuild
+  // would leave the dailies between the weekly file and the last daily unapplied (the Mon–Wed gap).
+  return () => writeFileSync(p, JSON.stringify(kind === 'full' ? { full: iso } : { ...prev, daily: iso }, null, 1));
 }
 function diff(prev: Rec[], next: Rec[]) {
   const p = new Map(prev.map(r => [r.call, r])); const up: Rec[] = []; const seen = new Set<string>();

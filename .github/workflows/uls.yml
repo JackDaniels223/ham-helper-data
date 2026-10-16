@@ -41,11 +41,11 @@ jobs:
           if [ "$M" = "full" ]; then
             U=https://data.fcc.gov/download/pub/uls/complete/l_amat.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
             curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d uls || exit 1
-            $P full uls out "$DATE" --last-modified "$LM" $F; rc=$?
+            $P full uls out "$DATE" --last-modified "$LM" $F && rc=0 || rc=$?
           else
             U=https://data.fcc.gov/download/pub/uls/daily/l_am_${DOW}.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
             curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d daily || exit 1
-            $P daily out/state.hhc.gz daily out "$DATE" --last-modified "$LM" $F; rc=$?
+            $P daily out/state.hhc.gz daily out "$DATE" --last-modified "$LM" $F && rc=0 || rc=$?
           fi
           if [ $rc -eq 75 ]; then echo "::notice::stale source, nothing published"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; fi
           exit $rc

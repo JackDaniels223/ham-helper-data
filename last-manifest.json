@@ -1,12 +1,1 @@
-{
-  "version": 2,
-  "format": "HHC1",
-  "generated": "2026-10-16T16:35:32.706Z",
-  "full": {
-    "url": "full-20261016.hhc.gz",
-    "bytes": 12498182,
-    "sha256": "feeceb98b9b7282e4d7256e80c290932beb9fd2ac4112f24940bb88471543922",
-    "built": "20261016"
-  },
-  "deltas": []
-}
+{"signed":"ed25519","kid":"hh1","payload":"{\n \"version\": 2,\n \"format\": \"HHC1\",\n \"generated\": \"2026-10-16T16:54:18.849Z\",\n \"full\": {\n  \"url\": \"full-20261016.hhc.gz\",\n  \"bytes\": 12498182,\n  \"sha256\": \"feeceb98b9b7282e4d7256e80c290932beb9fd2ac4112f24940bb88471543922\",\n  \"built\": \"20261016\"\n },\n \"deltas\": []\n}","sig":"b0tGB2X1B9yr2Ezgt8HL3ANztVI0Pi5XAMYEfpvLJxhfR4ikCQruw5Z0fw2R3bXkiFYeM7OBgnwsZa9bplVpAw=="}

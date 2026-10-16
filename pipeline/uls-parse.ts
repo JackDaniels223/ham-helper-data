@@ -90,7 +90,7 @@ export const GRACE_DAYS = 730; // 47 CFR §97.21(b): renewal possible up to 2 ye
 export const beyondGrace = (r: { expire: number }, dataDay: number) => r.expire > 0 && dataDay > r.expire + GRACE_DAYS;
 
 /* ---------- freshness (QA N-H1: never publish stale source data / never move records backwards) ---------- */
-export type Sources = { full?: string; daily?: string }; // PUBLIC file: no purge state here (QA b4cbdf1 M3)
+export type Sources = { full?: string; daily?: string; minVersion?: string }; // PUBLIC file: no purge state here (QA b4cbdf1 M3)
  // ISO Last-Modified of the last source file processed, per kind
 export type Fresh = { ok: true } | { ok: false; reason: string };
 /** A source file is accepted only if it is strictly newer than every source already processed (equal is allowed only with force). */

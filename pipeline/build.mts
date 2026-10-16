@@ -63,7 +63,7 @@ function freshOrExit(out: string, kind: 'full' | 'daily') {
   // A full build REPLACES the state, so the daily watermark resets to the full's date: every FCC daily posted after the weekly
   // file then applies again, in order (the workflow loops over all 7 retained dailies). Without this, a forced full rebuild
   // would leave the dailies between the weekly file and the last daily unapplied (the Mon–Wed gap).
-  return () => writeFileSync(p, JSON.stringify(kind === 'full' ? { full: iso } : { ...prev, daily: iso }, null, 1));
+  return () => writeFileSync(p, JSON.stringify(kind === 'full' ? { full: iso, ...(prev.minVersion ? { minVersion: prev.minVersion } : {}) } : { ...prev, daily: iso }, null, 1));
 }
 function diff(prev: Rec[], next: Rec[]) {
   const p = new Map(prev.map(r => [r.call, r])); const up: Rec[] = []; const seen = new Set<string>();
@@ -104,21 +104,35 @@ if (mode === 'full') {
   const bytes = write(out, deltaName(prev.built, date), text); logDelta(out, deltaName(prev.built, date), prev.built, date);
   writeState(out, encode({ kind: 'full', built: date, rows: [...cur.values()], deletes: [] })); if (purged) setPurge(out, true); commit();
   console.log(JSON.stringify({ mode, date, from: prev.built, upserts: up.length, deletes: del.size, skippedOlder, gzBytes: bytes, issues: acc.issues }));
+} else if (mode === 'reissue') {
+  // One-time forced full download (QA 3ff612b M): delta-202610161200 was once published with a different base, so phones that
+  // installed it sit at 202610161200 missing Mon–Wed and see themselves as current. Reissue the current state (no new FCC data)
+  // as a full file stamped one minute later and set minVersion to it: the old chain ends before the new full, so the manifest
+  // drops it and EVERY client (old app versions included) takes this full file once. The date shown in the app is unchanged.
+  const [out] = a; const st = readState(statePathOf(out)); const t = new Date(Date.parse(iso(st.built) + `T${st.built.slice(8, 10)}:${st.built.slice(10, 12)}:00Z`) + 60_000);
+  const nb = t.toISOString().replace(/[-:T]/g, '').slice(0, 12); const text = encode({ kind: 'full', built: nb, rows: st.rows, deletes: [] });
+  const f = fullName(out, nb, text); const bytes = write(out, f, text); writeState(out, text);
+  const sp = join(out, 'sources.json'); writeFileSync(sp, JSON.stringify({ ...readJson<object>(sp, {}), minVersion: nb }, null, 1));
+  console.log(JSON.stringify({ mode, from: st.built, built: nb, file: f, rows: st.rows.length, gzBytes: bytes }));
 } else if (mode === 'manifest') {
   const [out] = a; const files = readdirSync(out);
   const fulls = files.filter(f => fullKey(f)).sort((x, y) => fullKey(x)!.localeCompare(fullKey(y)!)); if (!fulls.length) throw new Error('no full file');
   const full = fulls[fulls.length - 1]; const fd = full.slice(5, 17);
   const meta = (f: string) => { const b = readFileSync(join(out, f)); return { url: f, bytes: b.length, sha256: createHash('sha256').update(b).digest('hex') }; };
-  // chain.json records each delta's true base (from) as it is written; keep the newest contiguous chain within KEEP_DAYS.
+  // chain.json records each delta's true base (from) as it is written. Walk back from the NEWEST version (max `to`), not the
+  // last entry, so a stale tail entry can never become the head (QA 3ff612b L); for a repeated `to`, the latest entry wins.
   const chain = readJson<{ file: string; from: string; to: string }[]>(join(out, 'chain.json'), []);
   const cutoff = new Date(Date.parse(iso(fd)) - KEEP_DAYS * 864e5).toISOString().slice(0, 10).replace(/-/g, '') + '0000';
-  const deltas: object[] = []; let expect: string | null = null;
-  for (let i = chain.length - 1; i >= 0; i--) { const c = chain[i]; if (expect && c.to !== expect) continue; /* superseded entry (another delta to a later stamp) */ if (c.from < cutoff) break; if (!existsSync(join(out, c.file))) break; deltas.unshift({ ...meta(c.file), from: c.from, to: c.to }); expect = c.from; }
+  const byTo = new Map<string, { file: string; from: string; to: string }>(); for (const c of chain) if (existsSync(join(out, c.file))) byTo.set(c.to, c);
+  const deltas: object[] = []; let expect: string | undefined = [...byTo.keys()].sort().pop(); const seen = new Set<string>();
+  for (let c = expect ? byTo.get(expect) : undefined; c && !seen.has(c.to) && c.from >= cutoff; c = byTo.get(c.from)) { seen.add(c.to); deltas.unshift({ ...meta(c.file), from: c.from, to: c.to }); }
   // A chain that stops before the full file (suppression purge week) is dropped: clients must take the full file.
   if (deltas.length && (deltas[deltas.length - 1] as { to: string }).to < fd) deltas.length = 0;
   // Prune chain.json to exactly the published chain (QA 8cea6f2 L: a stale entry for a superseded delta lingered).
   writeFileSync(join(out, 'chain.json'), JSON.stringify((deltas as { url: string; from: string; to: string }[]).map(d => ({ file: d.url, from: d.from, to: d.to })), null, 1));
-  const payload = JSON.stringify({ version: 3, format: 'HHC2', generated: new Date().toISOString(), full: { ...meta(full), built: fd }, deltas }, null, 1);
+  // minVersion (QA 3ff612b M): clients whose local version is older than this take the full file instead of deltas.
+  const minVersion = readJson<{ minVersion?: string }>(join(out, 'sources.json'), {}).minVersion;
+  const payload = JSON.stringify({ version: 3, format: 'HHC2', generated: new Date().toISOString(), full: { ...meta(full), built: fd }, deltas, ...(minVersion ? { minVersion } : {}) }, null, 1);
   const pem = keyFile ? readFileSync(keyFile, 'utf8') : process.env.MANIFEST_SIGNING_KEY; if (!pem) fail(1, 'ABORT: no signing key (MANIFEST_SIGNING_KEY or --key-file)');
   const sig = sign(null, Buffer.from(payload, 'utf8'), createPrivateKey(pem!)).toString('base64');
   writeFileSync(join(out, 'manifest.json'), JSON.stringify({ signed: 'ed25519', kid: 'hh1', payload, sig }));

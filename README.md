@@ -17,7 +17,7 @@ Callsign lookup data for the **Ham Helper** app. It's built automatically from t
 - **Approx. grid:** clients derive an approximate 4-character Maidenhead grid from the ZIP centroid, using the U.S. Census Bureau 2024 Gazetteer ZCTA file (public domain).
 
 ## Removal requests
-To have your callsign left out of this dataset, email **support@shiverlogic.com** with the subject "Callsign removal". Requests are handled within 7 days. The call is added to a private list kept only as an encrypted Actions secret; **no suppression list is published in this repo, plain or hashed**. It's omitted from the next build and deleted from installed apps by the next daily delta.
+To have your callsign removed from this dataset, email **support@shiverlogic.com** with the subject "Callsign removal" and include your callsign. We may ask you to confirm that you hold the license. Once confirmed, the record is excluded from the next data build, and installed apps remove it at their next update. No removal list is published in this repository.
 
 Your record stays public at the FCC. To change what the FCC publishes, update your license in ULS (https://www.fcc.gov/uls).
 

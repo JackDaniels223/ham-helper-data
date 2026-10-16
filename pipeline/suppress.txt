@@ -1,0 +1,1 @@
+# One callsign per line. Removed from every full file and delta (see docs/PRIVACY.md). Lines starting with # are ignored.

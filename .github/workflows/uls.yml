@@ -1,0 +1,57 @@
+# Builds the Ham Helper callsign data from FCC ULS public files. Uses only the built-in GITHUB_TOKEN.
+# Schedule: daily delta; full rebuild + reconcile delta on Sundays (when the FCC posts the weekly l_amat.zip).
+name: uls-data
+on:
+  schedule:
+    - cron: '30 13 * * *'   # daily 13:30 UTC (the FCC posts daily files ~08:00 ET; the weekly full file appears Sunday)
+  workflow_dispatch: {}
+permissions:
+  contents: write            # needed to upload release assets and push the keep-alive state commit
+concurrency: { group: uls-data, cancel-in-progress: false }
+jobs:
+  build:
+    runs-on: ubuntu-latest   # standard runner: free for public repos (no larger runners: those are always billed)
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: data }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Restore previous state from the rolling release
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          mkdir -p out && cd out
+          gh release download current --repo "$GITHUB_REPOSITORY" --pattern 'state.hhc.gz' --pattern 'chain.json' --pattern 'manifest.json' --pattern '*.hhc.gz' || echo "first run"
+      - name: Build
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y%m%d); DOW=$(date -u +%a | tr A-Z a-z)
+          P="node --no-warnings --import ./data/pipeline/ts-resolve.mjs data/pipeline/build.mts"
+          if [ -f out/manifest.json ] && [ "$(node -e "const m=require('./out/manifest.json');console.log(m.deltas.length?m.deltas.at(-1).to:m.full.built)")" = "$DATE" ]; then echo "already built $DATE"; echo SKIP=1 >> "$GITHUB_ENV"; exit 0; fi
+          if [ "$(date -u +%u)" = "7" ] || [ ! -f out/state.hhc.gz ]; then
+            curl -fsSL --retry 3 -o l_amat.zip https://data.fcc.gov/download/pub/uls/complete/l_amat.zip
+            unzip -q -o l_amat.zip -d uls
+            $P full uls out "$DATE"
+          else
+            curl -fsSL --retry 3 -o daily.zip "https://data.fcc.gov/download/pub/uls/daily/l_am_${DOW}.zip"
+            unzip -q -o daily.zip -d daily
+            $P daily out/state.hhc.gz daily out "$DATE"
+          fi
+          # prune files older than the rolling window (manifest only lists 35 days of deltas + the latest full)
+          find out -name 'delta-*.hhc.gz' -mtime +40 -delete; ls -t out/full-*.hhc.gz | tail -n +2 | xargs -r rm
+          $P manifest out
+      - name: Publish to the rolling release "current" (new dated files first, manifest last)
+        if: env.SKIP != '1'
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release view current --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create current --repo "$GITHUB_REPOSITORY" --title "Callsign data (rolling)" --notes "FCC ULS public amateur data, active licenses only. See README."
+          gh release upload current out/*.hhc.gz out/chain.json --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload current out/manifest.json --clobber --repo "$GITHUB_REPOSITORY"
+          # delete assets no longer referenced by the manifest
+          node -e "const m=require('./out/manifest.json');const keep=new Set(['manifest.json','state.hhc.gz','chain.json',m.full.url,...m.deltas.map(d=>d.url)]);console.log([...keep].join('\n'))" > keep.txt
+          gh release view current --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -vxFf keep.txt | xargs -r -I{} gh release delete-asset current {} -y --repo "$GITHUB_REPOSITORY"
+      - name: Keep-alive commit (scheduled workflows auto-disable after 60 days without repo activity)
+        run: |
+          cd data && cp ../out/manifest.json last-manifest.json
+          git config user.name "uls-bot"; git config user.email "uls-bot@users.noreply.github.com"
+          git add last-manifest.json && git commit -m "data $(date -u +%F)" && git push || echo "no change"

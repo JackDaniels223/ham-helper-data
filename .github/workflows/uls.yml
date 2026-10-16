@@ -52,6 +52,15 @@ jobs:
           lm() { curl -fsSIL --retry 3 "$1" | tr -d '\r' | awk 'tolower($1)=="last-modified:"{sub(/^[^:]*: */,""); v=$0} END{print v}'; }
           M="${MODE:-auto}"; if [ "$M" = "auto" ]; then if [ "$(date -u +%u)" = "7" ] || [ ! -f out/private/state.hhc.gz ]; then M=full; else M=daily; fi; fi
           [ ! -f out/private/state.hhc.gz ] && { M=full; F="--force"; echo "no private state: forced full rebuild"; }
+          rm -f out/new-files.txt
+          for d in mon tue wed thu fri sat sun; do U=https://data.fcc.gov/download/pub/uls/daily/l_am_$d.zip; L=$(lm $U); [ -n "$L" ] && printf '%s\t%s\t%s\n' "$(date -u -d "$L" +%s)" "$d" "$L"; done | sort -n > dailies.tsv
+          # Gap > retention (the FCC keeps 7 dailies): if even the oldest retained daily is >26 h newer than the last FCC file we
+          # applied, days are missing for good. Alert and force a full rebuild from the weekly file, then apply every daily.
+          W=$(node -e "const s=(()=>{try{return require('./out/sources.json')}catch{return {}}})();const t=[s.full,s.daily].filter(Boolean).map(Date.parse);console.log(t.length?Math.floor(Math.max(...t)/1000):0)")
+          OLDEST=$(head -1 dailies.tsv | cut -f1)
+          if [ "$M" = "daily" ] && [ -n "$OLDEST" ] && [ "$W" -gt 0 ] && [ "$OLDEST" -gt $((W + 26*3600)) ]; then
+            echo "::warning::gap of more than 7 days since the last applied FCC file ($(date -u -d @$W +%FT%TZ)); forcing a full rebuild"; M=full; F="--force"
+          fi
           published=0
           if [ "$M" = "full" ]; then
             U=https://data.fcc.gov/download/pub/uls/complete/l_amat.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
@@ -62,7 +71,6 @@ jobs:
           # Apply EVERY retained FCC daily (the FCC keeps 7) newer than the last one processed, oldest first, ordered by
           # Last-Modified. build.mts refuses (exit 75) any daily not newer than the watermark, so this is idempotent.
           [ -f out/private/state.hhc.gz ] || { echo "no state and no full build"; exit 1; }
-          for d in mon tue wed thu fri sat sun; do U=https://data.fcc.gov/download/pub/uls/daily/l_am_$d.zip; L=$(lm $U); [ -n "$L" ] && printf '%s\t%s\t%s\n' "$(date -u -d "$L" +%s)" "$d" "$L"; done | sort -n > dailies.tsv
           while IFS=$'\t' read -r ts d L; do
             rm -rf daily && curl -fsSL --retry 3 -o d.zip https://data.fcc.gov/download/pub/uls/daily/l_am_$d.zip && unzip -q -o d.zip -d daily || exit 1
             echo "daily l_am_$d Last-Modified: $L"
@@ -94,7 +102,11 @@ jobs:
           set -euo pipefail
           [ -f out/chain.json ] || echo "[]" > out/chain.json
           gh release view current --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create current --repo "$GITHUB_REPOSITORY" --title "Callsign data (rolling)" --notes "FCC ULS public amateur data, active licenses only. See README."
-          gh release upload current out/*.hhc.gz out/chain.json out/sources.json --clobber --repo "$GITHUB_REPOSITORY"
+          # Dated files are immutable: upload only the names this run created, WITHOUT --clobber, and refuse if any already exists.
+          touch out/new-files.txt; existing=$(gh release view current --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          if grep -qxFf <(printf '%s\n' "$existing") out/new-files.txt; then echo "::error::refusing to overwrite an existing release file"; grep -xFf <(printf '%s\n' "$existing") out/new-files.txt; exit 1; fi
+          if [ -s out/new-files.txt ]; then (cd out && xargs -a new-files.txt gh release upload current --repo "$GITHUB_REPOSITORY"); fi
+          gh release upload current out/chain.json out/sources.json --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload current out/manifest.json --clobber --repo "$GITHUB_REPOSITORY"
           node -e "const e=require('./out/manifest.json');const m=JSON.parse(e.payload);console.log(['manifest.json','chain.json','sources.json',m.full.url,...m.deltas.map(d=>d.url)].join('\n'))" > keep.txt
           gh release view current --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | { grep -vxFf keep.txt || true; } | xargs -r -I{} gh release delete-asset current {} -y --repo "$GITHUB_REPOSITORY"

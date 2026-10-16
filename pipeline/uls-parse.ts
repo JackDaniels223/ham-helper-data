@@ -9,7 +9,7 @@
  *   AM: 2 USI, 5 call_sign, 6 operator_class (T G A E N P; blank for club/military/RACES stations)
  * Joins are on unique_system_identifier; an EN/AM row whose call_sign disagrees with its HD row is ignored and counted.
  */
-import { sha256Hex, SUPPRESS_SALT, type Rec } from './lib';
+import { type Rec } from './lib';
 export const OPERATOR_CLASSES = { T: 'Technician', G: 'General', A: 'Advanced', E: 'Extra', N: 'Novice', P: 'Technician Plus' } as const;
 export type Raw = { call: string; status: string; grant: number; expire: number; name?: string; city?: string; state?: string; zip?: string; cls?: string; enType?: string };
 export const toDays = (s: string) => { if (!s) return 0; const [m, d, y] = s.split('/').map(Number); return Math.round(Date.UTC(y, m - 1, d) / 864e5); };
@@ -20,7 +20,7 @@ export class UlsAccumulator {
     const r = this.m.get(+f[1]); if (!r) { this.issues.enOrphan++; return; }
     const c = (f[4] ?? '').trim().toUpperCase(); if (c && c !== r.call) { this.issues.enCallMismatch++; return; }
     if (r.name && r.enType === 'L' && f[5] !== 'L') return; // the licensee (L) row wins over contact/other entity rows
-    r.enType = f[5]; r.name = f[7]; r.city = f[16]; r.state = (f[17] || '').toUpperCase(); r.zip = (f[18] || '').slice(0, 5); // f[15] street: never copied
+    r.enType = f[5]; r.name = decodeEntities(f[7]).trim(); r.city = sanitizeCity(f[16]); r.state = (f[17] || '').toUpperCase(); r.zip = (f[18] || '').slice(0, 5); // f[15] street: never copied
   }
   am(f: string[]) {
     const r = this.m.get(+f[1]); if (!r) { this.issues.amOrphan++; return; }
@@ -31,22 +31,63 @@ export class UlsAccumulator {
 }
 export const toRec = (r: Raw): Rec => ({ call: r.call, name: r.name ?? '', cls: r.cls ?? '', city: r.city ?? '', state: r.state ?? '', zip: r.zip ?? '', grant: r.grant, expire: r.expire });
 /** Active rows, one per callsign (if two active licenses ever share a call, the latest grant wins). */
-export function activeRecs(m: Map<number, Raw>, suppressed: (call: string) => boolean): Rec[] {
+export function activeRecs(m: Map<number, Raw>, suppressed: (call: string) => boolean, dataDay = 0): Rec[] {
   const by = new Map<string, Raw>();
-  for (const r of m.values()) { if (r.status !== 'A' || !r.call || suppressed(r.call)) continue; const o = by.get(r.call); if (!o || r.grant > o.grant) by.set(r.call, r); }
+  for (const r of m.values()) { if (r.status !== 'A' || !r.call || suppressed(r.call) || beyondGrace(r, dataDay)) continue; const o = by.get(r.call); if (!o || r.grant > o.grant) by.set(r.call, r); }
   return [...by.values()].map(toRec);
 }
 export const sameRec = (a: Rec, b: Rec) => a.name === b.name && a.cls === b.cls && a.city === b.city && a.state === b.state && a.zip === b.zip && a.grant === b.grant && a.expire === b.expire;
 export function classDistribution(rows: Rec[]): Record<string, number> {
   const d: Record<string, number> = {}; for (const r of rows) { const k = r.cls || '(blank)'; d[k] = (d[k] ?? 0) + 1; } return d;
 }
-/** Suppression list entries are sha256hex(SUPPRESS_SALT + CALL) (QA N-M1); lines starting with # are comments. */
-export const suppressHash = (call: string) => sha256Hex(new TextEncoder().encode(SUPPRESS_SALT + call.trim().toUpperCase()));
-export function parseSuppress(text: string): (call: string) => boolean {
-  const set = new Set(text.split('\n').map(l => l.trim().toLowerCase()).filter(l => l && !l.startsWith('#')));
-  for (const h of set) if (!/^[0-9a-f]{64}$/.test(h)) throw new Error(`suppress.txt: not a sha256 hash: ${h.slice(0, 12)}… (store hashes, never callsigns)`);
-  return call => set.size > 0 && set.has(suppressHash(call));
+/**
+ * Removal requests: newline-separated callsigns from the Actions secret SUPPRESS_LIST (never committed or published,
+ * hashed or plain). Lines starting with # are comments. Those calls are omitted from every file and deleted by the next delta.
+ */
+export function parseSuppress(text: string | undefined): (call: string) => boolean {
+  const set = new Set<string>();
+  for (const l of (text ?? '').split(/\r?\n/)) { const c = l.trim().toUpperCase(); if (!c || c.startsWith('#')) continue; if (!/^[A-Z0-9]{3,7}$/.test(c)) throw new Error('SUPPRESS_LIST: an entry is not a callsign (value not shown)'); set.add(c); }
+  return call => set.has(call);
 }
+
+/* ---------- city sanitising (QA: street addresses / suites / ZIPs had been typed into EN city) ---------- */
+const ENTITIES: Record<string, string> = { amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', nbsp: ' ' };
+export const decodeEntities = (s: string) => (s ?? '').replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e: string) => {
+  if (e[0] === '#') { const n = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10); return Number.isFinite(n) && n > 0 && n < 0x110000 ? String.fromCodePoint(n) : ''; }
+  return ENTITIES[e.toLowerCase()] ?? m;
+});
+/** Anything that must never be published as a city: digits, '#', ';', '&', '@', unit/suite/PMB/PO-box words. */
+export function addressLike(city: string): boolean {
+  const c = city.trim(); if (!c) return false;
+  if (c.toUpperCase() === '29 PALMS') return false; // a real city name (Twentynine Palms, CA)
+  return /[0-9#;&@]/.test(c) || /^(apt|apartment|suite|unit|pmb|bldg|trlr|spc)\b\.?/i.test(c) || /\b(p\.?\s?o\.?\s*box|pmb|suite|apt)\b/i.test(c);
+}
+/** City name only. Salvages "City, ST 12345" / "City 12345" to "City"; blanks anything else that looks like an address. */
+export function sanitizeCity(raw: string): string {
+  let c = decodeEntities(raw ?? '').replace(/\s+/g, ' ').trim();
+  const m = /^([A-Za-z][A-Za-z .'-]*?)[\s,.]*(?:\b[A-Za-z]{2}\b\.?|\b[A-Za-z]{3,5}\.)?[\s,.]*\d{4,5}(?:-\d{4})?[\s,.]*$/.exec(c);
+  if (m && /[A-Za-z]{3}/.test(m[1])) c = m[1].replace(/[\s,.]+$/, '');
+  return addressLike(c) ? '' : c;
+}
+/** Street-address shape in a free-text field ("12 Example Street", "200 Example PL NW"). */
+const STREET = /\b\d+[A-Z]?\s+(?:[NSEW]\.?\s+)?(?:[A-Za-z0-9]+\s+){0,3}(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|hwy|highway|way|pl|place|cir|circle|cv|cove|ter|terrace|pkwy|parkway)\b\.?/i;
+/** Hard guard: throws (failing the run) if any published row still carries an address-like value or a suppressed call. */
+export function assertClean(rows: Rec[], suppressed: (c: string) => boolean): void {
+  let bad = 0; const sample: string[] = [];
+  for (const r of rows) {
+    const why = addressLike(r.city) ? 'city' : STREET.test(r.city) ? 'city-street' : STREET.test(r.name) || /\b(p\.?\s?o\.?\s*box|pmb)\b/i.test(r.name) ? 'name' : /&(#\d+|#x[0-9a-f]+|[a-z]+);/i.test(r.name + r.city) ? 'entity' : !/^(\d{5})?$/.test(r.zip) ? 'zip' : suppressed(r.call) ? 'suppressed' : null;
+    if (why) { bad++; if (sample.length < 5) sample.push(`${why}:${r.call}`); }
+  }
+  if (bad) throw new Error(`PRIVACY GUARD: ${bad} record(s) failed (${sample.join(', ')}); nothing written`);
+}
+/** Version stamp = the FCC file's Last-Modified time, UTC, YYYYMMDDHHMM (QA: stamp with the data date, not the build date). */
+export function stampOf(lastModified: string): string {
+  const d = new Date(Date.parse(lastModified)); if (Number.isNaN(d.getTime())) throw new Error('bad Last-Modified');
+  return d.toISOString().replace(/[-:T]/g, '').slice(0, 12);
+}
+export const GRACE_DAYS = 730; // 47 CFR §97.21(b): renewal possible up to 2 years after expiry
+/** Beyond the 2-year grace period a license can no longer be renewed: excluded even if HD still says Active. */
+export const beyondGrace = (r: { expire: number }, dataDay: number) => r.expire > 0 && dataDay > r.expire + GRACE_DAYS;
 
 /* ---------- freshness (QA N-H1: never publish stale source data / never move records backwards) ---------- */
 export type Sources = { full?: string; daily?: string }; // ISO Last-Modified of the last source file processed, per kind
@@ -65,7 +106,7 @@ export function checkCount(prev: number | null, next: number, maxPct = 2): Fresh
   return pct <= maxPct ? { ok: true } : { ok: false, reason: `active count changed ${pct.toFixed(2)}% (${prev} → ${next}); limit ${maxPct}%` };
 }
 /** Daily merge that never moves a record backwards: an older grant never overwrites a newer one. */
-export function mergeDaily(cur: Map<string, Rec>, m: Map<number, Raw>, suppressed: (c: string) => boolean): { up: Rec[]; del: Set<string>; skippedOlder: number } {
+export function mergeDaily(cur: Map<string, Rec>, m: Map<number, Raw>, suppressed: (c: string) => boolean, dataDay = 0): { up: Rec[]; del: Set<string>; skippedOlder: number } {
   const up = new Map<string, Rec>(); const del = new Set<string>(); let skippedOlder = 0;
   for (const r of m.values()) {
     if (!r.call) continue;
@@ -78,5 +119,6 @@ export function mergeDaily(cur: Map<string, Rec>, m: Map<number, Raw>, suppresse
       if (!old || !sameRec(old, rec)) { cur.set(r.call, rec); up.set(r.call, rec); del.delete(r.call); }
     } else if (old && old.grant <= r.grant) { cur.delete(r.call); up.delete(r.call); del.add(r.call); }
   }
+  for (const [c, r] of cur) if (beyondGrace(r, dataDay) || suppressed(c)) { cur.delete(c); up.delete(c); del.add(c); } // aged out of grace / newly suppressed
   return { up: [...up.values()], del, skippedOlder };
 }

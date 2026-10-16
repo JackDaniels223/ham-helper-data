@@ -3,7 +3,9 @@
 # Safety (QA N-H1): every source file's HTTP Last-Modified must be newer than the last one processed (sources.json),
 # otherwise the build exits 75 and nothing is published; the daily merge never applies an older license over a newer one;
 # a full build whose active count moves > 2% is refused. The manifest is Ed25519-signed (secret MANIFEST_SIGNING_KEY,
-# used only in the signing step). Other auth: the built-in GITHUB_TOKEN only.
+# used only in the signing step). Removal requests: secret SUPPRESS_LIST (newline-separated callsigns, build step only; never
+# committed or published). Version stamps = the FCC file's Last-Modified (UTC YYYYMMDDHHMM). A privacy guard fails the
+# build if any address-like value survives city sanitising. Actions are pinned by commit SHA. Other auth: GITHUB_TOKEN only.
 name: uls-data
 on:
   schedule:
@@ -20,9 +22,9 @@ jobs:
     runs-on: ubuntu-24.04    # pinned (ubuntu-latest moves to 26.04 from 2026-10-19)
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { path: data }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: '22' }
       - name: Restore previous state from the rolling release
         env: { GH_TOKEN: '${{ github.token }}' }
@@ -30,10 +32,10 @@ jobs:
           mkdir -p out && cd out
           gh release download current --repo "$GITHUB_REPOSITORY" --pattern 'state.hhc.gz' --pattern 'chain.json' --pattern 'sources.json' --pattern '*.hhc.gz' || echo "first run"
       - name: Build (fails closed on stale sources)
-        env: { MODE: '${{ inputs.mode }}', FORCE: '${{ inputs.force }}' }
+        env: { MODE: '${{ inputs.mode }}', FORCE: '${{ inputs.force }}', SUPPRESS_LIST: '${{ secrets.SUPPRESS_LIST }}' }
         run: |
           set -uo pipefail
-          DATE=$(date -u +%Y%m%d); DOW=$(date -u -d yesterday +%a | tr A-Z a-z)  # l_am_<day> holds <day>'s transactions and is posted the next morning (~08:00 UTC)
+          DOW=$(date -u -d yesterday +%a | tr A-Z a-z)  # l_am_<day> holds <day>'s transactions and is posted the next morning (~08:00 UTC)
           P="node --no-warnings --experimental-transform-types --import ./data/pipeline/ts-resolve.mjs data/pipeline/build.mts"
           F=""; [ "${FORCE:-false}" = "true" ] && F="--force"
           lm() { curl -fsSIL --retry 3 "$1" | tr -d '\r' | awk 'tolower($1)=="last-modified:"{sub(/^[^:]*: */,""); v=$0} END{print v}'; }
@@ -41,11 +43,11 @@ jobs:
           if [ "$M" = "full" ]; then
             U=https://data.fcc.gov/download/pub/uls/complete/l_amat.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
             curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d uls || exit 1
-            $P full uls out "$DATE" --last-modified "$LM" $F && rc=0 || rc=$?
+            $P full uls out --last-modified "$LM" $F && rc=0 || rc=$?
           else
             U=https://data.fcc.gov/download/pub/uls/daily/l_am_${DOW}.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
             curl -fsSL --retry 3 -o src.zip $U && unzip -q -o src.zip -d daily || exit 1
-            $P daily out/state.hhc.gz daily out "$DATE" --last-modified "$LM" $F && rc=0 || rc=$?
+            $P daily out/state.hhc.gz daily out --last-modified "$LM" $F && rc=0 || rc=$?
           fi
           if [ $rc -eq 75 ]; then echo "::notice::stale source, nothing published"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; fi
           exit $rc

@@ -5,8 +5,8 @@ Callsign lookup data for the **Ham Helper** app. It's built automatically from t
 - **Source:** FCC ULS public database downloads, https://www.fcc.gov/uls/transactions/daily-weekly (`l_amat.zip` weekly, `l_am_<day>.zip` daily).
 - **Contents:** active amateur licenses only, with callsign, licensee name, city, state, ZIP5, operator class, grant date and expiry date.
   - **No street addresses, PO boxes or FRNs** are read or published. No license history is included. The FCC *city* field is cleaned to a city name only (some licensees typed addresses there), and the build fails if any address-like value survives.
-  - Licenses past the FCC's 2-year renewal grace period are excluded.
-- **Where it lives:** release [`current`](../../releases/tag/current), with `manifest.json`, `full-YYYYMMDD.hhc.gz` and `delta-YYYYMMDD.hhc.gz`. Each file is listed in the manifest with its byte size and sha256.
+  - Licenses past the FCC's 2-year renewal grace period are excluded, measured from the FCC file's date (so a license can appear for up to about a week after its grace period ends, until the next weekly rebuild).
+- **Where it lives:** release [`current`](../../releases/tag/current), with `manifest.json`, `full-YYYYMMDDHHMM.hhc.gz` and `delta-YYYYMMDDHHMM.hhc.gz`. The build's working state is private: it is kept only in an encrypted Actions cache and is never published. Each file is listed in the manifest with its byte size and sha256.
 - **Schedule** (`.github/workflows/uls.yml`):
   - Daily at 15:30 UTC: a delta built from yesterday's FCC daily file (`l_am_<day>.zip` is posted the morning after).
   - Sundays: a full rebuild from the FCC weekly file, plus a reconcile delta, so clients keep updating via deltas (a 35-day rolling chain).
@@ -17,7 +17,7 @@ Callsign lookup data for the **Ham Helper** app. It's built automatically from t
 - **Approx. grid:** clients derive an approximate 4-character Maidenhead grid from the ZIP centroid, using the U.S. Census Bureau 2024 Gazetteer ZCTA file (public domain).
 
 ## Removal requests
-To have your callsign removed from this dataset, email **support@shiverlogic.com** with the subject "Callsign removal" and include your callsign. We may ask you to confirm that you hold the license. Once confirmed, the record is excluded from the next data build, and installed apps remove it at their next update. No removal list is published in this repository.
+To have your callsign removed from this dataset, email **support@shiverlogic.com** with the subject "Callsign removal" and include your callsign. We may ask you to confirm that you hold the license. Once confirmed, the record is excluded from all future files. No removal list is published anywhere: removals never appear in the daily delta files; instead the next weekly full rebuild resets the delta chain, so installed apps download a fresh full file without the record (normally within about a week).
 
 Your record stays public at the FCC. To change what the FCC publishes, update your license in ULS (https://www.fcc.gov/uls).
 

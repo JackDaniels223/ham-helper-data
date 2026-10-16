@@ -90,7 +90,8 @@ export const GRACE_DAYS = 730; // 47 CFR §97.21(b): renewal possible up to 2 ye
 export const beyondGrace = (r: { expire: number }, dataDay: number) => r.expire > 0 && dataDay > r.expire + GRACE_DAYS;
 
 /* ---------- freshness (QA N-H1: never publish stale source data / never move records backwards) ---------- */
-export type Sources = { full?: string; daily?: string }; // ISO Last-Modified of the last source file processed, per kind
+export type Sources = { full?: string; daily?: string }; // PUBLIC file: no purge state here (QA b4cbdf1 M3)
+ // ISO Last-Modified of the last source file processed, per kind
 export type Fresh = { ok: true } | { ok: false; reason: string };
 /** A source file is accepted only if it is strictly newer than every source already processed (equal is allowed only with force). */
 export function checkFresh(prev: Sources, kind: 'full' | 'daily', lastModified: string | undefined, force = false): Fresh {
@@ -106,11 +107,14 @@ export function checkCount(prev: number | null, next: number, maxPct = 2): Fresh
   return pct <= maxPct ? { ok: true } : { ok: false, reason: `active count changed ${pct.toFixed(2)}% (${prev} → ${next}); limit ${maxPct}%` };
 }
 /** Daily merge that never moves a record backwards: an older grant never overwrites a newer one. */
-export function mergeDaily(cur: Map<string, Rec>, m: Map<number, Raw>, suppressed: (c: string) => boolean, dataDay = 0): { up: Rec[]; del: Set<string>; skippedOlder: number } {
-  const up = new Map<string, Rec>(); const del = new Set<string>(); let skippedOlder = 0;
+export function mergeDaily(cur: Map<string, Rec>, m: Map<number, Raw>, suppressed: (c: string) => boolean, dataDay = 0): { up: Rec[]; del: Set<string>; skippedOlder: number; purged: number } {
+  // Suppressed calls are dropped from state but NEVER listed in a delta's DELETES (that would publish them in plain text,
+  // QA re-verify row 3). The caller sets the PRIVATE purge flag (out/private/purge.json); the next weekly full build then breaks the delta chain so every
+  // client re-downloads a full file that simply lacks them.
+  const up = new Map<string, Rec>(); const del = new Set<string>(); let skippedOlder = 0; let purged = 0;
   for (const r of m.values()) {
     if (!r.call) continue;
-    if (suppressed(r.call)) { if (cur.delete(r.call)) del.add(r.call); up.delete(r.call); continue; }
+    if (suppressed(r.call)) { if (cur.delete(r.call)) purged++; up.delete(r.call); del.delete(r.call); continue; }
     const old = cur.get(r.call);
     if (r.status === 'A') {
       if (old && old.grant > r.grant) { skippedOlder++; continue; }
@@ -119,6 +123,9 @@ export function mergeDaily(cur: Map<string, Rec>, m: Map<number, Raw>, suppresse
       if (!old || !sameRec(old, rec)) { cur.set(r.call, rec); up.set(r.call, rec); del.delete(r.call); }
     } else if (old && old.grant <= r.grant) { cur.delete(r.call); up.delete(r.call); del.add(r.call); }
   }
-  for (const [c, r] of cur) if (beyondGrace(r, dataDay) || suppressed(c)) { cur.delete(c); up.delete(c); del.add(c); } // aged out of grace / newly suppressed
-  return { up: [...up.values()], del, skippedOlder };
+  for (const [c, r] of cur) {
+    if (suppressed(c)) { cur.delete(c); up.delete(c); del.delete(c); purged++; } // newly suppressed: silent, see above
+    else if (beyondGrace(r, dataDay)) { cur.delete(c); up.delete(c); del.add(c); } // aged out of grace
+  }
+  return { up: [...up.values()], del, skippedOlder, purged };
 }

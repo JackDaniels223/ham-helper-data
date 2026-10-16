@@ -2,13 +2,14 @@
 // Ham Helper callsign data pipeline (Node 22, --experimental-transform-types). Nothing here uploads anything.
 //   P="node --no-warnings --experimental-transform-types --import ./data-pipeline/ts-resolve.mjs data-pipeline/build.mts"
 //   $P full  <uls-dir: extracted l_amat.zip> <out-dir> --last-modified "<HTTP Last-Modified>" [--force]
-//   $P daily <prev state.hhc.gz> <uls-dir: extracted l_am_<day>.zip> <out-dir> --last-modified "<…>" [--force]
+//   $P daily <out-dir>/private/state.hhc.gz <uls-dir: extracted l_am_<day>.zip> <out-dir> --last-modified "<…>" [--force]
 // Version stamp = the source file's Last-Modified (UTC YYYYMMDDHHMM), i.e. the FCC data date, not the build date.
 // Removal requests come from env SUPPRESS_LIST (newline-separated callsigns, an Actions secret); nothing is committed.
 //   $P manifest <out-dir> [--key-file <pem>]   signs with Ed25519: env MANIFEST_SIGNING_KEY (PEM) or --key-file
 //   $P stategrid <uls-dir>                     most-common grid per state (for scripts/zip-grid-build.mjs)
 // Exit 75 = stale source (not newer than the last one processed): nothing is written; the workflow skips publishing.
-// Outputs: full-*.hhc.gz, delta-*.hhc.gz, state.hhc.gz, chain.json, sources.json, manifest.json (signed envelope).
+// Public outputs: full-*.hhc.gz, delta-*.hhc.gz, chain.json, sources.json, manifest.json (signed envelope).
+// PRIVATE outputs (never published, Actions cache only): private/state.hhc.gz, private/purge.json. Purge state is never logged.
 import { createReadStream, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { gzipSync, gunzipSync } from 'node:zlib';
@@ -50,28 +51,39 @@ function diff(prev: Rec[], next: Rec[]) {
   for (const r of next) { seen.add(r.call); const o = p.get(r.call); if (!o || !sameRec(o, r)) up.push(r); }
   return { up, del: prev.filter(r => !seen.has(r.call)).map(r => r.call) };
 }
+// PRIVATE state (QA b4cbdf1 M3): <out>/private/ holds state.hhc.gz (full current state, which would reveal suppressed calls
+// when diffed against the public files) and purge.json (pending-purge flag). The workflow keeps this folder in the Actions
+// cache only; the release upload is `out/*.hhc.gz` (non-recursive), so nothing under private/ is ever published.
+const privDir = (out: string) => { const d = join(out, 'private'); mkdirSync(d, { recursive: true }); return d; };
+const statePathOf = (out: string) => join(privDir(out), 'state.hhc.gz');
+const purgeFile = (out: string) => join(privDir(out), 'purge.json');
+const setPurge = (out: string, pending: boolean) => writeFileSync(purgeFile(out), JSON.stringify({ pending }));
+const writeState = (out: string, text: string) => { writeFileSync(statePathOf(out), gzipSync(Buffer.from(text, 'utf8'), { level: 9 })); };
 const KEEP_DAYS = 35; // rolling delta window kept in the manifest
 
 if (mode === 'full') {
   const [dir, out] = a; const commit = freshOrExit(out, 'full'); const date = stampOf(lastModified!);
   const acc = await readUls(dir); const rows = activeRecs(acc.m, suppressed, dayOf(date)); assertClean(rows, suppressed);
-  const statePath = join(out, 'state.hhc.gz'); const prev = existsSync(statePath) ? readState(statePath) : null;
+  const statePath = statePathOf(out); const prev = existsSync(statePath) ? readState(statePath) : null;
   const cc = checkCount(prev?.rows.length ?? null, rows.length); if (!cc.ok && !force) fail(1, `ABORT: ${cc.reason}`);
   const text = encode({ kind: 'full', built: date, rows, deletes: [] });
   // Weekly reconcile delta: diff the previous state against this fresh full build, so clients never need a re-download.
   let reconcile: object | null = null;
-  if (prev && prev.built < date) { const d = diff(prev.rows, rows); write(out, `delta-${date}.hhc.gz`, encode({ kind: 'delta', built: date, rows: d.up, deletes: d.del })); logDelta(out, `delta-${date}.hhc.gz`, prev.built, date); reconcile = { from: prev.built, upserts: d.up.length, deletes: d.del.length }; }
-  const bytes = write(out, `full-${date}.hhc.gz`, text); write(out, 'state.hhc.gz', text); commit();
+  // Suppression purge (pending from a daily run, or a suppressed call still in state): NO reconcile delta, which breaks the
+  // chain so clients take this full file. Removals therefore never appear in any DELETES list.
+  const purge = readJson<{ pending?: boolean }>(purgeFile(out), {}).pending === true || !!prev?.rows.some(r => suppressed(r.call));
+  if (prev && prev.built < date && !purge) { const d = diff(prev.rows, rows); write(out, `delta-${date}.hhc.gz`, encode({ kind: 'delta', built: date, rows: d.up, deletes: d.del })); logDelta(out, `delta-${date}.hhc.gz`, prev.built, date); reconcile = { from: prev.built, upserts: d.up.length, deletes: d.del.length }; }
+  const bytes = write(out, `full-${date}.hhc.gz`, text); writeState(out, text); setPurge(out, false); commit();
   console.log(JSON.stringify({ mode, date, licenses: acc.m.size, active: rows.length, rawBytes: Buffer.byteLength(text), gzBytes: bytes, reconcile, classes: classDistribution(rows), issues: acc.issues }));
 } else if (mode === 'daily') {
   const [prevPath, dir, out] = a; const commit = freshOrExit(out, 'daily'); const date = stampOf(lastModified!);
   const prev = readState(prevPath); if (prev.built >= date) fail(75, `SKIP: state already at ${prev.built}`); // same ordering as checkFresh
   const cur = new Map(prev.rows.map(r => [r.call, r])); const acc = await readUls(dir);
-  const { up, del, skippedOlder } = mergeDaily(cur, acc.m, suppressed, dayOf(date)); assertClean(up, suppressed); assertClean([...cur.values()], suppressed);
+  const { up, del, skippedOlder, purged } = mergeDaily(cur, acc.m, suppressed, dayOf(date)); assertClean(up, suppressed); assertClean([...cur.values()], suppressed);
   if (del.size > prev.rows.length * 0.02) fail(1, `ABORT: ${del.size} deletes is more than 2% of ${prev.rows.length}`);
   const text = encode({ kind: 'delta', built: date, rows: up, deletes: [...del] });
   const bytes = write(out, `delta-${date}.hhc.gz`, text); logDelta(out, `delta-${date}.hhc.gz`, prev.built, date);
-  write(out, 'state.hhc.gz', encode({ kind: 'full', built: date, rows: [...cur.values()], deletes: [] })); commit();
+  writeState(out, encode({ kind: 'full', built: date, rows: [...cur.values()], deletes: [] })); if (purged) setPurge(out, true); commit();
   console.log(JSON.stringify({ mode, date, from: prev.built, upserts: up.length, deletes: del.size, skippedOlder, gzBytes: bytes, issues: acc.issues }));
 } else if (mode === 'manifest') {
   const [out] = a; const files = readdirSync(out);
@@ -83,6 +95,8 @@ if (mode === 'full') {
   const cutoff = new Date(Date.parse(iso(fd)) - KEEP_DAYS * 864e5).toISOString().slice(0, 10).replace(/-/g, '') + '0000';
   const deltas: object[] = []; let expect: string | null = null;
   for (let i = chain.length - 1; i >= 0; i--) { const c = chain[i]; if (expect && c.to !== expect) break; if (c.from < cutoff) break; if (!existsSync(join(out, c.file))) break; deltas.unshift({ ...meta(c.file), from: c.from, to: c.to }); expect = c.from; }
+  // A chain that stops before the full file (suppression purge week) is dropped: clients must take the full file.
+  if (deltas.length && (deltas[deltas.length - 1] as { to: string }).to < fd) deltas.length = 0;
   const payload = JSON.stringify({ version: 3, format: 'HHC2', generated: new Date().toISOString(), full: { ...meta(full), built: fd }, deltas }, null, 1);
   const pem = keyFile ? readFileSync(keyFile, 'utf8') : process.env.MANIFEST_SIGNING_KEY; if (!pem) fail(1, 'ABORT: no signing key (MANIFEST_SIGNING_KEY or --key-file)');
   const sig = sign(null, Buffer.from(payload, 'utf8'), createPrivateKey(pem!)).toString('base64');

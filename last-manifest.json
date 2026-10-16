@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "format": "HHC1",
+  "generated": "2026-10-16T16:35:32.706Z",
+  "full": {
+    "url": "full-20261016.hhc.gz",
+    "bytes": 12498182,
+    "sha256": "feeceb98b9b7282e4d7256e80c290932beb9fd2ac4112f24940bb88471543922",
+    "built": "20261016"
+  },
+  "deltas": []
+}

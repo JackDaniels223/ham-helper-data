@@ -69,7 +69,7 @@ export function sanitizeCity(raw: string): string {
   if (m && /[A-Za-z]{3}/.test(m[1])) c = m[1].replace(/[\s,.]+$/, '');
   return addressLike(c) ? '' : c;
 }
-/** Street-address shape in a free-text field ("12 Example Street", "200 Example PL NW"). */
+/** Street-address shape in a free-text field ("123B Example Street", "12000 Example PL NW"). */
 const STREET = /\b\d+[A-Z]?\s+(?:[NSEW]\.?\s+)?(?:[A-Za-z0-9]+\s+){0,3}(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|hwy|highway|way|pl|place|cir|circle|cv|cove|ter|terrace|pkwy|parkway)\b\.?/i;
 /** Hard guard: throws (failing the run) if any published row still carries an address-like value or a suppressed call. */
 export function assertClean(rows: Rec[], suppressed: (c: string) => boolean): void {

@@ -109,7 +109,12 @@ if (mode === 'full') {
   // installed it sit at 202610161200 missing Mon–Wed and see themselves as current. Reissue the current state (no new FCC data)
   // as a full file stamped one minute later and set minVersion to it: the old chain ends before the new full, so the manifest
   // drops it and EVERY client (old app versions included) takes this full file once. The date shown in the app is unchanged.
-  const [out] = a; const st = readState(statePathOf(out)); const t = new Date(Date.parse(iso(st.built) + `T${st.built.slice(8, 10)}:${st.built.slice(10, 12)}:00Z`) + 60_000);
+  // Guard (QA L): a second reissue of the SAME data would bump minVersion again and make every device re-download ~12.8 MB.
+  // If the state is already the current reissue (state.built === minVersion, no FCC data since), skip unless --force.
+  const [out] = a; const st = readState(statePathOf(out));
+  const curMin = readJson<{ minVersion?: string }>(join(out, 'sources.json'), {}).minVersion;
+  if (curMin && st.built === curMin && !force) fail(75, `SKIP: data ${st.built} is already the current reissue (minVersion ${curMin}); nothing new to reissue. Use force to reissue anyway.`);
+  const t = new Date(Date.parse(iso(st.built) + `T${st.built.slice(8, 10)}:${st.built.slice(10, 12)}:00Z`) + 60_000);
   const nb = t.toISOString().replace(/[-:T]/g, '').slice(0, 12); const text = encode({ kind: 'full', built: nb, rows: st.rows, deletes: [] });
   const f = fullName(out, nb, text); const bytes = write(out, f, text); writeState(out, text);
   const sp = join(out, 'sources.json'); writeFileSync(sp, JSON.stringify({ ...readJson<object>(sp, {}), minVersion: nb }, null, 1));

@@ -16,7 +16,7 @@ on:
     - cron: '30 15 * * *'   # daily 15:30 UTC (FCC posts dailies ~08:00 UTC; the weekly l_amat.zip ~13:20 UTC Sunday)
   workflow_dispatch:
     inputs:
-      mode: { description: 'auto | full | daily | reissue (one-time forced full download for every client)', default: 'auto', type: choice, options: [auto, full, daily, reissue] }
+      mode: { description: 'auto | full | daily | reissue (one-time forced full download for every client; skipped if already reissued unless force)', default: 'auto', type: choice, options: [auto, full, daily, reissue] }
       force: { description: 'Re-process a source file with the SAME Last-Modified (never an older one)', default: false, type: boolean }
 permissions:
   contents: write
@@ -64,7 +64,8 @@ jobs:
           published=0
           if [ "$M" = "reissue" ]; then
             [ -f out/private/state.hhc.gz ] || { echo "::error::reissue needs the private state"; exit 1; }
-            $P reissue out || exit 1; published=1; M=daily
+            $P reissue out $F && rc=0 || rc=$?
+            if [ $rc -eq 0 ]; then published=1; elif [ $rc -eq 75 ]; then echo "::notice::reissue skipped: already reissued, no new data (set force to override)"; else exit $rc; fi; M=daily
           fi
           if [ "$M" = "full" ]; then
             U=https://data.fcc.gov/download/pub/uls/complete/l_amat.zip; LM=$(lm $U); echo "source $U Last-Modified: $LM"
